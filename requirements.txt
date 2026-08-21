@@ -1,0 +1,10 @@
+fastapi
+uvicorn
+langserve[all]
+langchain-core
+google-genai
+pypdf
+python-docx
+requests==2.32.4
+gradio
+sse_starlette
