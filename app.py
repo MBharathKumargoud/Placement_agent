@@ -8,7 +8,7 @@ from pathlib import Path
 from html import escape
 
 from fastapi import FastAPI, UploadFile, File, Form
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, JSONResponse
 
 from pypdf import PdfReader
 from docx import Document
@@ -823,6 +823,15 @@ document
             }
 
 
+            if (!data.analysis) {
+
+                throw new Error(
+                    data.detail ||
+                    "Backend returned no career analysis."
+                );
+            }
+
+
             status.innerText =
                 "✅ Career analysis completed.";
 
@@ -891,11 +900,14 @@ async def analyze_uploaded_resume(
         ".txt"
     ]:
 
-        return {
-            "detail":
-                "Only PDF, DOCX and TXT "
-                "files are supported."
-        }
+        return JSONResponse(
+            status_code=400,
+            content={
+                "detail":
+                    "Only PDF, DOCX and TXT "
+                    "files are supported."
+            }
+        )
 
 
     # Save temporary file
@@ -943,10 +955,13 @@ async def analyze_uploaded_resume(
 
     except Exception as error:
 
-        return {
-            "detail":
-                str(error)
-        }
+        return JSONResponse(
+            status_code=500,
+            content={
+                "detail":
+                    str(error)
+            }
+        )
 
 
     finally:
