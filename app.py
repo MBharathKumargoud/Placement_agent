@@ -2,7 +2,6 @@ import os
 import json
 import time
 import tempfile
-import traceback
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -26,24 +25,37 @@ from langserve import add_routes
 # CONFIGURATION
 # ============================================================
 
-# Both are stable Gemini models.
-# You can override these in Render Environment Variables.
-PRIMARY_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.6-flash")
-FALLBACK_MODEL = os.getenv("GEMINI_FALLBACK_MODEL", "gemini-3.5-flash")
+# Models are tried in this order.
+# If one model is temporarily unavailable, the next one is tried.
+MODELS = [
+    "gemini-3.8-flash",
+    "gemini-3.7-flash",
+    "gemini-3.6-flash",
+    "gemini-3.5-flash",
+]
 
-MAX_RESUME_CHARS = 30000
-MAX_GITHUB_CHARS = 30000
+# Number of attempts for each model when the error is transient.
+MAX_RETRIES_PER_MODEL = 2
 
-SUPPORTED_EXTENSIONS = {".pdf", ".docx", ".txt"}
+# Gemini transient errors that are normally worth retrying.
+RETRYABLE_STATUS_CODES = {
+    408,
+    429,
+    500,
+    502,
+    503,
+    504,
+}
 
 
 # ============================================================
 # RESUME EXTRACTION
 # ============================================================
 
-def extract_resume_text(file_path: str):
+def extract_resume_text(file_path: str) -> str:
     extension = Path(file_path).suffix.lower()
 
+    # PDF
     if extension == ".pdf":
         reader = PdfReader(file_path)
         pages = []
@@ -58,17 +70,19 @@ def extract_resume_text(file_path: str):
         if text.strip():
             return text
 
+    # DOCX
     elif extension == ".docx":
         document = Document(file_path)
+
         text = "\n".join(
             paragraph.text
             for paragraph in document.paragraphs
-            if paragraph.text.strip()
         )
 
         if text.strip():
             return text
 
+    # TXT
     elif extension == ".txt":
         text = Path(file_path).read_text(
             encoding="utf-8",
@@ -80,7 +94,8 @@ def extract_resume_text(file_path: str):
 
     raise ValueError(
         "Could not extract text from the resume. "
-        "Please upload a valid PDF, DOCX or TXT file."
+        "Please upload a valid PDF, DOCX or TXT file "
+        "containing selectable text."
     )
 
 
@@ -93,16 +108,18 @@ def github_get(url: str):
         url,
         headers={
             "Accept": "application/vnd.github+json",
-            "User-Agent": "CareerPlacementAgent"
+            "User-Agent": "CareerPlacementAgent",
         },
-        timeout=20
+        timeout=20,
     )
+
     response.raise_for_status()
     return response.json()
 
 
 def analyze_github(github_url: str):
     github_url = github_url.strip().rstrip("/")
+
     parsed = urlparse(github_url)
 
     if (
@@ -110,10 +127,15 @@ def analyze_github(github_url: str):
         or parsed.netloc.lower() != "github.com"
     ):
         raise ValueError(
-            "Please enter a valid public GitHub URL."
+            "Please enter a valid public GitHub profile URL, "
+            "for example: https://github.com/username"
         )
 
-    parts = [p for p in parsed.path.split("/") if p]
+    parts = [
+        part
+        for part in parsed.path.split("/")
+        if part
+    ]
 
     if not parts:
         raise ValueError(
@@ -122,6 +144,16 @@ def analyze_github(github_url: str):
 
     username = parts[0]
 
+    if username.lower() in {"login", "signup", "settings"}:
+        raise ValueError(
+            "Please enter a GitHub profile URL, not a GitHub site page."
+        )
+
+    print(f"[GitHub] Analyzing profile: {username}", flush=True)
+
+    # IMPORTANT:
+    # These are real API URLs. Do not replace them with
+    # Markdown/HTML links.
     profile = github_get(
         f"https://api.github.com/users/{username}"
     )
@@ -145,26 +177,36 @@ def analyze_github(github_url: str):
                 languages.get(language, 0) + 1
             )
 
-        repo_data.append({
-            "name": repo.get("name"),
-            "description": repo.get("description"),
-            "language": language,
-            "stars": repo.get("stargazers_count", 0),
-            "forks": repo.get("forks_count", 0),
-            "url": repo.get("html_url")
-        })
+        repo_data.append(
+            {
+                "name": repo.get("name"),
+                "description": repo.get("description"),
+                "language": language,
+                "stars": repo.get(
+                    "stargazers_count",
+                    0,
+                ),
+                "forks": repo.get(
+                    "forks_count",
+                    0,
+                ),
+                "url": repo.get("html_url"),
+            }
+        )
 
     return {
         "profile": {
             "username": profile.get("login"),
             "name": profile.get("name"),
             "bio": profile.get("bio"),
-            "public_repositories": profile.get("public_repos"),
+            "public_repositories": profile.get(
+                "public_repos"
+            ),
             "followers": profile.get("followers"),
-            "profile_url": profile.get("html_url")
+            "profile_url": profile.get("html_url"),
         },
         "languages": languages,
-        "repositories": repo_data[:30]
+        "repositories": repo_data[:30],
     }
 
 
@@ -178,6 +220,7 @@ You are Career Placement Agent.
 You are an expert career coach for students and early-career candidates.
 
 Analyze exactly THREE sources:
+
 1. Resume
 2. Public GitHub profile/repositories
 3. Candidate's target job role
@@ -251,137 +294,135 @@ Never invent information.
 
 
 # ============================================================
-# GEMINI ERROR DETECTION
+# GEMINI ERROR HELPERS
 # ============================================================
 
-def is_retryable_error(error):
-    text = str(error).upper()
-    code = getattr(error, "code", None)
+def error_text(error: Exception) -> str:
+    """
+    Convert an exception into a useful log/frontend message
+    without exposing the API key.
+    """
+    message = str(error).strip()
 
-    return (
-        code in {408, 429, 500, 502, 503, 504}
-        or "503" in text
-        or "UNAVAILABLE" in text
-        or "SERVICE_UNAVAILABLE" in text
-        or "RESOURCE_EXHAUSTED" in text
-        or "429" in text
-        or "TIMEOUT" in text
+    if not message:
+        message = repr(error)
+
+    # Never accidentally display the API key if an SDK exception
+    # contains it in its text.
+    api_key = os.getenv("GOOGLE_API_KEY", "").strip()
+
+    if api_key and api_key in message:
+        message = message.replace(
+            api_key,
+            "[REDACTED_API_KEY]"
+        )
+
+    return message
+
+
+def is_retryable_error(error: Exception) -> bool:
+    """
+    Detect common transient Gemini/API errors.
+    """
+    message = error_text(error).lower()
+
+    for code in RETRYABLE_STATUS_CODES:
+        if str(code) in message:
+            return True
+
+    transient_words = [
+        "unavailable",
+        "resource_exhausted",
+        "rate limit",
+        "rate_limit",
+        "too many requests",
+        "temporarily",
+        "internal server error",
+        "deadline exceeded",
+        "timeout",
+        "timed out",
+        "service unavailable",
+        "bad gateway",
+        "gateway timeout",
+    ]
+
+    return any(
+        word in message
+        for word in transient_words
     )
 
 
 # ============================================================
-# GEMINI CALL WITH RETRY + FALLBACK
-# ============================================================
-
-def call_gemini_with_resilience(client, prompt):
-    models_to_try = [PRIMARY_MODEL]
-
-    if FALLBACK_MODEL and FALLBACK_MODEL != PRIMARY_MODEL:
-        models_to_try.append(FALLBACK_MODEL)
-
-    last_error = None
-
-    for model_name in models_to_try:
-
-        # 3 attempts per model.
-        for attempt in range(3):
-
-            try:
-                print(
-                    f"Gemini model={model_name}, "
-                    f"attempt={attempt + 1}/3"
-                )
-
-                response = client.models.generate_content(
-                    model=model_name,
-                    contents=prompt,
-                    config=types.GenerateContentConfig(
-                        system_instruction=SYSTEM_INSTRUCTION
-                    )
-                )
-
-                if response and response.text:
-                    print(
-                        f"Gemini success using {model_name}"
-                    )
-                    return response.text
-
-                raise RuntimeError(
-                    f"{model_name} returned an empty response."
-                )
-
-            except Exception as error:
-                last_error = error
-
-                print(
-                    f"Gemini error on {model_name}: "
-                    f"{error}"
-                )
-
-                if not is_retryable_error(error):
-                    raise
-
-                if attempt < 2:
-                    # 2, 4 seconds, then move to fallback.
-                    delay = 2 ** (attempt + 1)
-
-                    print(
-                        f"Retrying {model_name} in "
-                        f"{delay} seconds..."
-                    )
-
-                    time.sleep(delay)
-
-        print(
-            f"{model_name} unavailable after retries."
-        )
-
-    raise RuntimeError(
-        "Gemini is temporarily unavailable. "
-        "Both the primary and fallback models "
-        "failed after retries. Please try again shortly."
-    ) from last_error
-
-
-# ============================================================
-# CAREER ANALYSIS
+# GEMINI CAREER ANALYSIS
 # ============================================================
 
 def generate_career_analysis(
-    resume_text,
-    github_url,
-    target_role
-):
+    resume_text: str,
+    github_url: str,
+    target_role: str,
+) -> str:
+
     if not resume_text.strip():
-        raise ValueError("Resume could not be read.")
-
-    if not github_url.strip():
-        raise ValueError("GitHub URL is required.")
-
-    if not target_role.strip():
-        raise ValueError("Target job role is required.")
-
-    api_key = os.getenv("GOOGLE_API_KEY")
-
-    if not api_key or not api_key.strip():
-        raise RuntimeError(
-            "GOOGLE_API_KEY is missing in Render Environment Variables."
+        raise ValueError(
+            "Resume could not be read."
         )
 
-    resume_for_model = resume_text[:MAX_RESUME_CHARS]
+    if not github_url.strip():
+        raise ValueError(
+            "GitHub URL is required."
+        )
+
+    if not target_role.strip():
+        raise ValueError(
+            "Target job role is required."
+        )
+
+    google_api_key = os.getenv(
+        "GOOGLE_API_KEY",
+        ""
+    ).strip()
+
+    if not google_api_key:
+        raise ValueError(
+            "GOOGLE_API_KEY is not configured on the server."
+        )
+
+    # Keep the request size reasonable.
+    resume_for_model = resume_text[:30000]
+
+    # --------------------------------------------------------
+    # GitHub
+    # --------------------------------------------------------
 
     try:
         github_data = analyze_github(github_url)
+
     except Exception as error:
-        print("GitHub error:", error)
+        github_error = error_text(error)
+
+        print(
+            f"[GitHub ERROR] {github_error}",
+            flush=True
+        )
+
+        # Do not completely stop the career analysis just because
+        # GitHub could not be read.
         github_data = {
-            "error": str(error)
+            "error": (
+                "GitHub data could not be retrieved. "
+                f"Reason: {github_error}"
+            )
         }
 
     github_for_model = json.dumps(
         github_data,
-        indent=2
-    )[:MAX_GITHUB_CHARS]
+        indent=2,
+        ensure_ascii=False,
+    )[:30000]
+
+    # --------------------------------------------------------
+    # Prompt
+    # --------------------------------------------------------
 
     user_prompt = f"""
 TARGET JOB ROLE
@@ -399,33 +440,129 @@ PUBLIC GITHUB PROFILE
 Create the complete personalized career roadmap.
 
 Base the analysis ONLY on:
-1. Supplied resume
-2. Supplied GitHub information
-3. Target job role
+1. The supplied resume
+2. The supplied public GitHub information
+3. The supplied target job role
 
 Do not invent information.
-If something is unavailable, clearly say that it is missing.
+If information is unavailable, explicitly state that it is unavailable.
 """
 
+    # --------------------------------------------------------
+    # Gemini client
+    # --------------------------------------------------------
+
     client = genai.Client(
-        api_key=api_key.strip()
+        api_key=google_api_key
     )
 
-    return call_gemini_with_resilience(
-        client,
-        user_prompt
+    errors = []
+
+    # --------------------------------------------------------
+    # Try all configured models
+    # --------------------------------------------------------
+
+    for model_name in MODELS:
+
+        for attempt in range(
+            1,
+            MAX_RETRIES_PER_MODEL + 1
+        ):
+
+            print(
+                f"[Gemini] model={model_name} "
+                f"attempt={attempt}",
+                flush=True,
+            )
+
+            try:
+                response = client.models.generate_content(
+                    model=model_name,
+                    contents=user_prompt,
+                    config=types.GenerateContentConfig(
+                        system_instruction=SYSTEM_INSTRUCTION,
+                        temperature=0.4,
+                    ),
+                )
+
+                if not response.text:
+                    raise ValueError(
+                        f"{model_name} returned an empty response."
+                    )
+
+                print(
+                    f"[Gemini SUCCESS] model={model_name}",
+                    flush=True,
+                )
+
+                return response.text
+
+            except Exception as error:
+
+                message = error_text(error)
+
+                print(
+                    f"[Gemini ERROR] "
+                    f"model={model_name} "
+                    f"attempt={attempt}: "
+                    f"{message}",
+                    flush=True,
+                )
+
+                errors.append(
+                    f"{model_name} attempt {attempt}: {message}"
+                )
+
+                # Non-transient errors should immediately move
+                # to the next model.
+                if not is_retryable_error(error):
+                    print(
+                        f"[Gemini] Non-retryable error for "
+                        f"{model_name}; moving to next model.",
+                        flush=True,
+                    )
+                    break
+
+                # Retry transient errors only.
+                if attempt < MAX_RETRIES_PER_MODEL:
+                    wait_seconds = 2 ** attempt
+
+                    print(
+                        f"[Gemini] Retrying "
+                        f"{model_name} in "
+                        f"{wait_seconds}s...",
+                        flush=True,
+                    )
+
+                    time.sleep(wait_seconds)
+
+    # --------------------------------------------------------
+    # All models failed
+    # --------------------------------------------------------
+
+    print(
+        "[Gemini FINAL ERROR] All configured models failed.",
+        flush=True,
+    )
+
+    # Keep the useful information, but cap its size.
+    error_summary = "\n".join(errors[-8:])[:5000]
+
+    raise RuntimeError(
+        "Gemini request failed after trying all configured models.\n\n"
+        f"Attempts:\n{error_summary}"
     )
 
 
 # ============================================================
-# LANGCHAIN
+# LANGCHAIN RUNNABLE
 # ============================================================
 
 career_runnable = RunnableLambda(
     lambda x: generate_career_analysis(
         x["resume_text"],
         x["github_url"],
-        x["target_role"]
+        x["target_role"],
     )
 )
 
@@ -436,18 +573,7 @@ career_runnable = RunnableLambda(
 
 app = FastAPI(
     title="Career Placement Agent",
-    version="1.0"
-)
-
-
-# ============================================================
-# LANGSERVE
-# ============================================================
-
-add_routes(
-    app,
-    career_runnable,
-    path="/agent-api"
+    version="2.0",
 )
 
 
@@ -456,33 +582,49 @@ add_routes(
 # ============================================================
 
 @app.get("/health")
-async def health_check():
+async def health():
     return {
         "status": "ok",
-        "primary_model": PRIMARY_MODEL,
-        "fallback_model": FALLBACK_MODEL
+        "service": "Career Placement Agent",
+        "models": MODELS,
+        "gemini_key_configured": bool(
+            os.getenv("GOOGLE_API_KEY", "").strip()
+        ),
     }
 
 
 # ============================================================
-# FRONTEND
+# LANGSERVE BACKEND
+# ============================================================
+
+add_routes(
+    app,
+    career_runnable,
+    path="/agent-api",
+)
+
+
+# ============================================================
+# SINGLE USER PAGE
 # ============================================================
 
 @app.get(
     "/agent/playground/",
-    response_class=HTMLResponse
+    response_class=HTMLResponse,
 )
 async def career_page():
 
-    html = r"""
+    html = """
 <!DOCTYPE html>
 <html>
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
+
 <title>Career Placement Agent</title>
 
 <style>
+
 body {
     font-family: Arial, sans-serif;
     background: #f5f7fb;
@@ -542,7 +684,7 @@ button:hover {
 }
 
 button:disabled {
-    background: #93c5fd;
+    background: #94a3b8;
     cursor: not-allowed;
 }
 
@@ -564,11 +706,19 @@ button:disabled {
 
 .error {
     color: #dc2626;
+    white-space: pre-wrap;
 }
 
 .success {
-    color: #16a34a;
+    color: #15803d;
 }
+
+.small {
+    color: #666;
+    font-size: 13px;
+    margin-top: 8px;
+}
+
 </style>
 </head>
 
@@ -589,235 +739,405 @@ Upload your resume, provide your GitHub profile and enter your target job role.
 <input
     type="file"
     id="resume"
+    name="resume"
     accept=".pdf,.docx,.txt"
     required
 >
+
+<div class="small">
+Supported formats: PDF, DOCX, TXT
+</div>
+
 
 <label>🔗 GitHub Profile URL</label>
 
 <input
     type="text"
     id="github_url"
+    name="github_url"
     placeholder="https://github.com/username"
     required
 >
+
 
 <label>🎯 Interested Job Role</label>
 
 <input
     type="text"
     id="target_role"
+    name="target_role"
     placeholder="Example: Data Analyst"
     required
 >
 
-<button type="submit" id="analyzeButton">
+
+<button
+    id="analyzeButton"
+    type="submit"
+>
 🚀 Analyze My Career
 </button>
 
 </form>
 
+
 <div id="status"></div>
+
 <div id="result"></div>
 
 </div>
 
+
 <script>
+
 document
 .getElementById("careerForm")
-.addEventListener("submit", async function(event) {
+.addEventListener(
+    "submit",
+    async function(event) {
 
-    event.preventDefault();
+        event.preventDefault();
 
-    const resume =
-        document.getElementById("resume").files[0];
+        const resume =
+            document.getElementById("resume").files[0];
 
-    const github =
-        document.getElementById("github_url").value.trim();
+        const github =
+            document.getElementById("github_url").value.trim();
 
-    const role =
-        document.getElementById("target_role").value.trim();
+        const role =
+            document.getElementById("target_role").value.trim();
 
-    const status =
-        document.getElementById("status");
+        const status =
+            document.getElementById("status");
 
-    const result =
-        document.getElementById("result");
+        const result =
+            document.getElementById("result");
 
-    const button =
-        document.getElementById("analyzeButton");
+        const button =
+            document.getElementById("analyzeButton");
 
-    if (!resume) {
-        status.innerHTML =
-            '<span class="error">Please upload your resume.</span>';
-        return;
-    }
 
-    if (!github) {
-        status.innerHTML =
-            '<span class="error">Please enter your GitHub URL.</span>';
-        return;
-    }
+        if (!resume) {
 
-    if (!role) {
-        status.innerHTML =
-            '<span class="error">Please enter your target job role.</span>';
-        return;
-    }
+            status.innerHTML =
+                '<span class="error">' +
+                'Please upload your resume.' +
+                '</span>';
 
-    const formData = new FormData();
-
-    formData.append("resume", resume);
-    formData.append("github_url", github);
-    formData.append("target_role", role);
-
-    button.disabled = true;
-    button.innerText = "⏳ Analyzing...";
-
-    status.innerText =
-        "⏳ Analyzing your profile...";
-
-    result.innerText = "";
-
-    try {
-
-        const response = await fetch(
-            "/agent/analyze",
-            {
-                method: "POST",
-                body: formData
-            }
-        );
-
-        const data = await response.json();
-
-        if (!response.ok) {
-            throw new Error(
-                data.detail || "Analysis failed."
-            );
+            return;
         }
 
-        status.innerHTML =
-            '<span class="success">✅ Career analysis completed.</span>';
 
-        result.textContent =
-            data.analysis || "";
+        if (!github) {
 
-    } catch (error) {
+            status.innerHTML =
+                '<span class="error">' +
+                'Please enter your GitHub URL.' +
+                '</span>';
 
-        console.error(error);
+            return;
+        }
 
-        status.innerHTML =
-            '<span class="error">❌ ' +
-            error.message +
-            '</span>';
 
-    } finally {
+        if (!role) {
 
-        button.disabled = false;
-        button.innerText = "🚀 Analyze My Career";
+            status.innerHTML =
+                '<span class="error">' +
+                'Please enter your target job role.' +
+                '</span>';
+
+            return;
+        }
+
+
+        const formData =
+            new FormData();
+
+        formData.append(
+            "resume",
+            resume
+        );
+
+        formData.append(
+            "github_url",
+            github
+        );
+
+        formData.append(
+            "target_role",
+            role
+        );
+
+
+        status.innerText =
+            "⏳ Analyzing your profile... " +
+            "This may take a little while.";
+
+        result.innerText = "";
+
+        button.disabled = true;
+        button.innerText = "⏳ Analyzing...";
+
+
+        try {
+
+            const response =
+                await fetch(
+                    "/agent/analyze",
+                    {
+                        method: "POST",
+                        body: formData
+                    }
+                );
+
+
+            const data =
+                await response.json();
+
+
+            if (!response.ok) {
+
+                throw new Error(
+                    data.detail ||
+                    "Analysis failed."
+                );
+            }
+
+
+            if (!data.analysis) {
+
+                throw new Error(
+                    "The server returned an empty analysis."
+                );
+            }
+
+
+            status.innerHTML =
+                '<span class="success">' +
+                '✅ Career analysis completed.' +
+                '</span>';
+
+
+            // textContent keeps the generated response safe.
+            // Markdown is shown as readable plain text.
+            result.textContent =
+                data.analysis;
+
+        }
+
+        catch(error) {
+
+            status.innerHTML =
+                '<span class="error">' +
+                "❌ " +
+                error.message +
+                '</span>';
+
+            console.error(
+                "Career analysis error:",
+                error
+            );
+
+        }
+
+        finally {
+
+            button.disabled = false;
+            button.innerText =
+                "🚀 Analyze My Career";
+        }
+
     }
-});
+);
+
 </script>
 
 </body>
 </html>
 """
 
-    return HTMLResponse(content=html)
+    return HTMLResponse(
+        content=html
+    )
 
 
 # ============================================================
-# ANALYZE ENDPOINT
+# ANALYZE UPLOADED RESUME
 # ============================================================
 
 @app.post("/agent/analyze")
 async def analyze_uploaded_resume(
     resume: UploadFile = File(...),
     github_url: str = Form(...),
-    target_role: str = Form(...)
+    target_role: str = Form(...),
 ):
+
+    print(
+        "[Request] POST /agent/analyze "
+        f"filename={resume.filename!r} "
+        f"github={github_url!r} "
+        f"role={target_role!r}",
+        flush=True,
+    )
+
+    # --------------------------------------------------------
+    # Validate extension
+    # --------------------------------------------------------
+
     filename = resume.filename or ""
-    extension = Path(filename).suffix.lower()
 
-    if extension not in SUPPORTED_EXTENSIONS:
+    extension = Path(
+        filename
+    ).suffix.lower()
+
+    if extension not in {
+        ".pdf",
+        ".docx",
+        ".txt",
+    }:
         raise HTTPException(
             status_code=400,
-            detail="Only PDF, DOCX and TXT files are supported."
+            detail=(
+                "Only PDF, DOCX and TXT files "
+                "are supported."
+            ),
         )
 
-    file_bytes = await resume.read()
 
-    if not file_bytes:
+    # --------------------------------------------------------
+    # Validate form values
+    # --------------------------------------------------------
+
+    github_url = github_url.strip()
+    target_role = target_role.strip()
+
+    if not github_url:
         raise HTTPException(
             status_code=400,
-            detail="Uploaded resume is empty."
+            detail="GitHub URL is required.",
         )
+
+    if not target_role:
+        raise HTTPException(
+            status_code=400,
+            detail="Target job role is required.",
+        )
+
+
+    # --------------------------------------------------------
+    # Save uploaded resume to a unique temporary file
+    # --------------------------------------------------------
 
     temp_path = None
 
     try:
-        fd, temp_path = tempfile.mkstemp(
-            suffix=extension
-        )
-        os.close(fd)
 
-        with open(temp_path, "wb") as file:
+        file_bytes = await resume.read()
+
+        if not file_bytes:
+            raise HTTPException(
+                status_code=400,
+                detail="Uploaded resume is empty.",
+            )
+
+        fd, temp_path = tempfile.mkstemp(
+            suffix=extension,
+            prefix="career_resume_",
+        )
+
+        with os.fdopen(fd, "wb") as file:
             file.write(file_bytes)
+
+
+        # ----------------------------------------------------
+        # Extract resume
+        # ----------------------------------------------------
+
+        print(
+            "[Resume] Extracting text...",
+            flush=True,
+        )
 
         resume_text = extract_resume_text(
             temp_path
         )
 
+        print(
+            f"[Resume] Extracted "
+            f"{len(resume_text)} characters.",
+            flush=True,
+        )
+
+
+        # ----------------------------------------------------
+        # Generate analysis
+        # ----------------------------------------------------
+
         analysis = generate_career_analysis(
             resume_text,
             github_url,
-            target_role
+            target_role,
+        )
+
+
+        print(
+            "[Request] Career analysis completed.",
+            flush=True,
         )
 
         return {
             "analysis": analysis
         }
 
-    except ValueError as error:
-        raise HTTPException(
-            status_code=400,
-            detail=str(error)
-        )
 
-    except RuntimeError as error:
-        raise HTTPException(
-            status_code=503,
-            detail=str(error)
-        )
+    except HTTPException:
+        raise
+
 
     except Exception as error:
-        traceback.print_exc()
 
-        raise HTTPException(
-            status_code=500,
-            detail=f"Career analysis failed: {error}"
+        message = error_text(error)
+
+        print(
+            f"[Request ERROR] {message}",
+            flush=True,
         )
 
+        # IMPORTANT:
+        # This returns the actual error to the frontend instead
+        # of hiding everything behind:
+        # "Both primary and fallback models failed."
+        raise HTTPException(
+            status_code=500,
+            detail=message,
+        )
+
+
     finally:
+
         if temp_path and os.path.exists(temp_path):
+
             try:
                 os.remove(temp_path)
-            except Exception:
+            except OSError:
                 pass
 
 
 # ============================================================
-# START SERVER
+# UVICORN
 # ============================================================
 
 if __name__ == "__main__":
+
     port = int(
-        os.environ.get("PORT", "8000")
+        os.environ.get(
+            "PORT",
+            8000,
+        )
     )
 
     uvicorn.run(
         app,
         host="0.0.0.0",
-        port=port
+        port=port,
     )
