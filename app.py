@@ -27,15 +27,25 @@ from langserve import add_routes
 
 # Models are tried in this order.
 # If one model is temporarily unavailable, the next one is tried.
+# Start with the lighter, high-throughput models.
+# Google currently lists these as stable Gemini 3 models.
+# Flash-Lite is a better fit for a high-volume career-analysis app.
 MODELS = [
-    "gemini-3.8-flash",
-    "gemini-3.7-flash",
-    "gemini-3.6-flash",
+    "gemini-3.5-flash-lite",
+    "gemini-3.1-flash-lite",
     "gemini-3.5-flash",
+    "gemini-3.6-flash",
 ]
 
-# Number of attempts for each model when the error is transient.
+# The Gemini Python SDK already performs automatic retries for
+# transient 429/5xx errors. These are additional model-level
+# fallbacks if the first model remains unavailable.
 MAX_RETRIES_PER_MODEL = 2
+
+# Extra wait after the SDK has returned a transient error.
+# This prevents all fallback requests from hitting the service
+# at the same moment.
+RETRY_DELAYS = [5, 15]
 
 # Gemini transient errors that are normally worth retrying.
 RETRYABLE_STATUS_CODES = {
@@ -525,7 +535,12 @@ If information is unavailable, explicitly state that it is unavailable.
 
                 # Retry transient errors only.
                 if attempt < MAX_RETRIES_PER_MODEL:
-                    wait_seconds = 2 ** attempt
+                    wait_seconds = RETRY_DELAYS[
+                        min(
+                            attempt - 1,
+                            len(RETRY_DELAYS) - 1
+                        )
+                    ]
 
                     print(
                         f"[Gemini] Retrying "
