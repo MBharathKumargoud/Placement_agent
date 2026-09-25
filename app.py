@@ -146,7 +146,6 @@ def analyze_github(github_url: str):
         for part in parsed.path.split("/")
         if part
     ]
-
     if not parts:
         raise ValueError(
             "Could not determine GitHub username."
